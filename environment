@@ -1,0 +1,204 @@
+/*
+  ESP32 DHT11 + MQ-135 simple web meter
+  - Runs an AP "ESP32-AP"
+  - Serves a single-page HTML app embedded below
+  - Endpoint /data returns JSON: { temp, hum, mq_raw, mq_pct }
+  - Author: example code (customize pins & calibration as needed)
+*/
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include "DHT.h"
+
+// --------- CONFIG ----------
+const char* AP_SSID = "ESP32-AP";
+const char* AP_PASSWORD = "esp32pass"; // set to "" for open AP
+#define DHTPIN 4          // digital pin for DHT data
+#define DHTTYPE DHT11     // DHT 11
+#define MQ_PIN 34         // analog pin for MQ-135 (use input-only ADC pins like 34)
+const unsigned long SAMPLE_INTERVAL_MS = 2000; // how often sensors are read
+// ---------------------------
+
+DHT dht(DHTPIN, DHTTYPE);
+WebServer server(80);
+
+// HTML page served by ESP32 (raw string literal makes embedding easy)
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>ESP32 Sensor Meters</title>
+  <style>
+    body { font-family: system-ui, Arial; margin: 18px; background:#f6f7fb; color:#222; }
+    h1 { font-size: 20px; margin-bottom: 6px; }
+    .card { background:white; border-radius:12px; padding:14px; box-shadow:0 6px 18px rgba(30,30,60,0.08); margin-bottom:12px; }
+    .meter-row { display:flex; gap:12px; align-items:center; }
+    .gauge { width:140px; height:80px; }
+    .label { font-size:13px; color:#666; }
+    .value { font-weight:700; font-size:18px; }
+    .bar { height:14px; border-radius:8px; background:#e6e9f0; overflow:hidden; }
+    .bar-inner { height:100%; width:0%; border-radius:8px; transition: width 600ms ease; background: linear-gradient(90deg,#4caf50,#ff9800); }
+    .small { font-size:12px; color:#444; }
+    footer { margin-top:18px; font-size:12px; color:#666; }
+    @media (max-width:420px) { .meter-row { flex-direction:column; align-items:flex-start; } }
+  </style>
+</head>
+<body>
+  <h1>ESP32 — Sensors</h1>
+
+  <div class="card">
+    <div class="meter-row">
+      <div style="flex:1">
+        <div class="label">Temperature</div>
+        <div class="value" id="tempVal">-- °C</div>
+      </div>
+
+      <div style="flex:1">
+        <div class="label">Humidity</div>
+        <div class="value" id="humVal">-- %</div>
+      </div>
+
+      <div style="flex:1">
+        <div class="label">Air (MQ-135)</div>
+        <div class="value" id="mqVal">--</div>
+      </div>
+    </div>
+
+    <div style="margin-top:12px">
+      <div class="label small">Temperature meter</div>
+      <div class="bar" aria-hidden="true"><div id="tempBar" class="bar-inner"></div></div>
+      <div style="height:8px"></div>
+
+      <div class="label small">Humidity meter</div>
+      <div class="bar"><div id="humBar" class="bar-inner"></div></div>
+      <div style="height:8px"></div>
+
+      <div class="label small">Air quality (relative)</div>
+      <div class="bar"><div id="mqBar" class="bar-inner"></div></div>
+    </div>
+  </div>
+
+  <footer>Connect directly to the Wi-Fi SSID: <strong>ESP32-AP</strong> (password: esp32pass)</footer>
+
+<script>
+  async function fetchData(){
+    try {
+      const r = await fetch('/data');
+      if (!r.ok) throw new Error('network');
+      const j = await r.json();
+      // Display nicely
+      const t = j.temp;
+      const h = j.hum;
+      const mqPct = Math.round(j.mq_pct);
+      document.getElementById('tempVal').innerText = (isNaN(t) ? '--' : t.toFixed(1)+' °C');
+      document.getElementById('humVal').innerText = (isNaN(h) ? '--' : h.toFixed(1)+' %');
+      document.getElementById('mqVal').innerText = mqPct + ' %';
+
+      // Bars: clamp 0..100
+      const tPct = Math.max(0, Math.min(100, (isNaN(t) ? 0 : (t+10)/50*100 ))); // map temp roughly -10..40 -> 0..100
+      document.getElementById('tempBar').style.width = tPct + '%';
+      document.getElementById('humBar').style.width = (isNaN(h) ? 0 : Math.max(0, Math.min(100, h))) + '%';
+      document.getElementById('mqBar').style.width = mqPct + '%';
+
+    } catch(e){
+      console.log('fetch error', e);
+    }
+  }
+
+  // refresh every 2 seconds
+  fetchData();
+  setInterval(fetchData, 2000);
+</script>
+</body>
+</html>
+)rawliteral";
+
+unsigned long lastSample = 0;
+float lastTemp = NAN;
+float lastHum = NAN;
+int lastMqRaw = 0;
+float lastMqPct = 0.0;
+
+void handleRoot() {
+  server.send_P(200, "text/html", index_html);
+}
+
+void handleData() {
+  // Return JSON with sensor data
+  String json = "{";
+  if (isnan(lastTemp)) json += "\"temp\":null,";
+  else json += "\"temp\":" + String(lastTemp, 2) + ",";
+
+  if (isnan(lastHum)) json += "\"hum\":null,";
+  else json += "\"hum\":" + String(lastHum, 2) + ",";
+
+  json += "\"mq_raw\":" + String(lastMqRaw) + ",";
+  json += "\"mq_pct\":" + String(lastMqPct, 2);
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  // Setup DHT
+  dht.begin();
+
+  // Setup Wi-Fi AP
+  WiFi.softAP(AP_SSID, AP_PASSWORD);
+  IPAddress IP = WiFi.softAPIP();
+  Serial.println();
+  Serial.print("AP IP address: ");
+  Serial.println(IP);
+
+  // Start webserver
+  server.on("/", handleRoot);
+  server.on("/data", handleData);
+  server.begin();
+  Serial.println("HTTP server started");
+
+  // Configure ADC
+  analogReadResolution(12); // 0-4095
+  // (Optionally set attenuation if needed)
+  analogSetPinAttenuation(MQ_PIN, ADC_11db); // allow reading up to approx 3.3V
+}
+
+void loop() {
+  server.handleClient();
+
+  unsigned long now = millis();
+  if (now - lastSample >= SAMPLE_INTERVAL_MS) {
+    lastSample = now;
+    // Read DHT (use readTemperature and readHumidity)
+    float t = dht.readTemperature();
+    float h = dht.readHumidity();
+
+    if (isnan(t) || isnan(h)) {
+      Serial.println("Failed to read from DHT sensor!");
+      // Keep previous values as NaN or previous reading depending on preference
+      lastTemp = NAN;
+      lastHum = NAN;
+    } else {
+      lastTemp = t;
+      lastHum = h;
+      Serial.printf("Temp: %.2f C, Hum: %.2f %%\n", t, h);
+    }
+
+    // Read MQ-135 analog raw
+    int raw = analogRead(MQ_PIN); // 0..4095
+    lastMqRaw = raw;
+    // Convert to relative percent 0..100:
+    // We'll smooth and clamp. This is NOT calibrated PPM.
+    float pct = (raw / 4095.0) * 100.0;
+    // Optionally invert if your sensor outputs lower value for worse air — check your module
+    // pct = 100.0 - pct; // uncomment if needed
+
+    // Simple low-pass smoothing
+    lastMqPct = (lastMqPct * 0.6) + (pct * 0.4);
+
+    Serial.printf("MQ raw: %d, pct: %.2f\n", raw, lastMqPct);
+  }
+}
